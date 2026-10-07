@@ -42,18 +42,16 @@ class Media extends Playable {
       final uri = context.uri;
       final memory = context.memory;
       // Decrement reference count.
-      final references = ((ref[uri] ?? 0) - 1).clamp(0, 1 << 32);
-      ref[uri] = references;
+      ref[uri] = ((ref[uri] ?? 0) - 1).clamp(0, 1 << 32);
       // Remove [Media] instance from [cache] if reference count is 0.
-      if (references == 0) {
+      if (ref[uri] == 0) {
         cache.remove(uri);
-        ref.remove(uri);
       }
       // content:// : Close the possible file descriptor on Android.
       try {
         if (Platform.isAndroid) {
           final data = Uri.parse(uri);
-          if (references == 0 && data.isScheme('FD')) {
+          if (data.isScheme('FD')) {
             final fd = int.parse(data.authority);
             if (fd > 0) {
               await AndroidContentUriProvider.closeFileDescriptor(uri);
@@ -99,31 +97,16 @@ class Media extends Playable {
   /// Default: `null`.
   final Duration? end;
 
-  /// {@macro media}
-  factory Media(
-    String resource, {
-    Map<String, dynamic>? extras,
-    Map<String, String>? httpHeaders,
-    Duration? start,
-    Duration? end,
-  }) {
-    return Media._(
-      resource,
-      extras: extras,
-      httpHeaders: httpHeaders,
-      start: start,
-      end: end,
-      memory: false,
-    );
-  }
+  /// Whether instance is instantiated from [Media.memory].
+  bool _memory = false;
 
-  Media._(
+  /// {@macro media}
+  Media(
     String resource, {
     Map<String, dynamic>? extras,
     Map<String, String>? httpHeaders,
     this.start,
     this.end,
-    required bool memory,
   })  : uri = normalizeURI(resource),
         extras = extras ?? cache[normalizeURI(resource)]?.extras,
         httpHeaders =
@@ -140,7 +123,7 @@ class Media extends Playable {
       this,
       _MediaFinalizerContext(
         uri,
-        memory,
+        _memory,
       ),
     );
   }
@@ -154,10 +137,9 @@ class Media extends Playable {
   }) async {
     final file = await TempFile.create();
     await file.write_(data);
-    return Media._(
-      file.path,
-      memory: true,
-    );
+    final instance = Media(file.path);
+    instance._memory = true;
+    return instance;
   }
 
   /// Normalizes the passed URI.

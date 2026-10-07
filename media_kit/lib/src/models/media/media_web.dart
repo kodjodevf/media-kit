@@ -38,12 +38,10 @@ class Media extends Playable {
     final uri = context.uri;
     final memory = context.memory;
     // Decrement reference count.
-    final references = ((ref[uri] ?? 0) - 1).clamp(0, 1 << 32);
-    ref[uri] = references;
+    ref[uri] = ((ref[uri] ?? 0) - 1).clamp(0, 1 << 32);
     // Remove [Media] instance from [cache] if reference count is 0.
-    if (references == 0) {
+    if (ref[uri] == 0) {
       cache.remove(uri);
-      ref.remove(uri);
     }
     // Media.memory : Revoke the object URL.
     try {
@@ -79,31 +77,16 @@ class Media extends Playable {
   /// Default: `null`.
   final Duration? end;
 
-  /// {@macro media}
-  factory Media(
-    String resource, {
-    Map<String, dynamic>? extras,
-    Map<String, String>? httpHeaders,
-    Duration? start,
-    Duration? end,
-  }) {
-    return Media._(
-      resource,
-      extras: extras,
-      httpHeaders: httpHeaders,
-      start: start,
-      end: end,
-      memory: false,
-    );
-  }
+  /// Whether instance is instantiated from [Media.memory].
+  bool _memory = false;
 
-  Media._(
+  /// {@macro media}
+  Media(
     String resource, {
     Map<String, dynamic>? extras,
     Map<String, String>? httpHeaders,
     this.start,
     this.end,
-    required bool memory,
   })  : uri = normalizeURI(resource),
         extras = extras ?? cache[normalizeURI(resource)]?.extras,
         httpHeaders =
@@ -120,7 +103,7 @@ class Media extends Playable {
       this,
       _MediaFinalizerContext(
         uri,
-        memory,
+        _memory,
       ),
     );
   }
@@ -134,12 +117,9 @@ class Media extends Playable {
   }) {
     final blob = html.Blob(<JSUint8Array>[data.toJS].toJS);
     final object = html.URL.createObjectURL(blob);
-    return Future.value(
-      Media._(
-        object,
-        memory: true,
-      ),
-    );
+    final instance = Media(object);
+    instance._memory = true;
+    return Future.value(instance);
   }
 
   /// Normalizes the passed URI.
