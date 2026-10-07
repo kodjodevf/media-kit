@@ -3,6 +3,7 @@ description: package:media_kit video (& audio) playback native libraries for all
 version: 1.0.7
 homepage: https://github.com/media-kit/media-kit.git
 repository: https://github.com/media-kit/media-kit.git
+publish_to: none
 
 environment:
   sdk: ">=2.17.0 <4.0.0"
