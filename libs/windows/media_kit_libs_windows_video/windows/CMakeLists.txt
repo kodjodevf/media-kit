@@ -5,6 +5,7 @@
 # Use of this source code is governed by MIT license that can be found in the LICENSE file.
 
 cmake_minimum_required(VERSION 3.14)
+cmake_policy(SET CMP0175 NEW)
 
 # This option is read by the other packages which are part of package:media_kit.
 option(MEDIA_KIT_LIBS_AVAILABLE "package:media_kit libraries are available." ON)

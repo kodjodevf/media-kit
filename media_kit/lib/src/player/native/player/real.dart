@@ -13,6 +13,7 @@ import 'package:meta/meta.dart';
 import 'package:image/image.dart';
 import 'package:synchronized/synchronized.dart';
 import 'package:safe_local_storage/safe_local_storage.dart';
+import 'package:uri_parser/uri_parser.dart';
 
 import 'package:media_kit/ffi/ffi.dart';
 
@@ -50,8 +51,17 @@ void nativeEnsureInitialized({String? libmpv}) {
     print('$tag Found ${references.length} reference(s).');
     print('$tag Disposing:\n${references.map((e) => e.address).join('\n')}');
 
-    // I can only get quit to work; [mpv_terminate_destroy] causes direct crash.
+    // First, clear wakeup callbacks on all old handles to prevent mpv from
+    // invoking deleted Dart NativeCallable trampolines (SIGABRT on Flutter 3.38+).
+    // mpv_set_wakeup_callback is synchronous: once it returns, mpv will never
+    // call the old (dead) trampoline again.
+    // See: https://github.com/media-kit/media-kit/issues/1314
     final mpv = generated.MPV(DynamicLibrary.open(NativeLibrary.path));
+    for (final reference in references) {
+      mpv.mpv_set_wakeup_callback(reference.cast(), nullptr, nullptr);
+    }
+
+    // Now it's safe to send quit; mpv won't try to notify Dart anymore.
     final cmd = 'quit'.toNativeUtf8();
     try {
       for (final reference in references) {
@@ -185,7 +195,7 @@ class NativePlayer extends PlatformPlayer {
           await _command(
             [
               'loadfile',
-              playlist[i].uri,
+              _sanitizeUri(playlist[i].uri),
               'append',
             ],
           );
@@ -194,7 +204,7 @@ class NativePlayer extends PlatformPlayer {
         final file = await TempFile.create();
         final buffer = StringBuffer();
         for (final media in playlist) {
-          buffer.writeln(media.uri);
+          buffer.writeln(_sanitizeUri(media.uri));
         }
         final list = buffer.toString();
 
@@ -473,7 +483,7 @@ class NativePlayer extends PlatformPlayer {
       }
       // ---------------------------------------------
 
-      await _command(['loadfile', media.uri, 'append']);
+      await _command(['loadfile', _sanitizeUri(media.uri), 'append']);
     }
 
     if (synchronized) {
@@ -1263,16 +1273,19 @@ class NativePlayer extends PlatformPlayer {
     }
 
     final name = property.toNativeUtf8();
-    final value = mpv.mpv_get_property_string(ctx, name.cast());
-    if (value != nullptr) {
-      final result = value.cast<Utf8>().toDartString();
+    try {
+      final value = mpv.mpv_get_property_string(ctx, name.cast());
+      if (value != nullptr) {
+        try {
+          return value.cast<Utf8>().toDartString();
+        } finally {
+          mpv.mpv_free(value.cast());
+        }
+      }
+      return '';
+    } finally {
       calloc.free(name);
-      mpv.mpv_free(value.cast());
-
-      return result;
     }
-
-    return "";
   }
 
   /// Observes property for the internal libmpv instance of this [Player].
@@ -1345,6 +1358,67 @@ class NativePlayer extends PlatformPlayer {
     final reply = property.hashCode;
     observed.remove(property);
     mpv.mpv_unobserve_property(ctx, reply);
+  }
+
+  /// Observes event for the internal libmpv instance of this [Player].
+  /// Please use this method only if you know what you are doing, existing methods in [Player] implementation are suited for the most use cases.
+  ///
+  /// See:
+  /// * https://mpv.io/manual/master/#list-of-events
+  ///
+  Future<void> observeEvent(
+    int event,
+    Future<void> Function(Pointer<generated.mpv_event>) listener, {
+    bool waitForInitialization = true,
+  }) async {
+    if (disposed) {
+      throw AssertionError('[Player] has been disposed');
+    }
+
+    if (waitForInitialization) {
+      await waitForPlayerInitialization;
+      await waitForVideoControllerInitializationIfAttached;
+    }
+
+    if (observedEvents.containsKey(event)) {
+      throw ArgumentError.value(
+        event,
+        'event',
+        'Already observed',
+      );
+    }
+    observedEvents[event] = listener;
+    _logError(mpv.mpv_request_event(ctx, event, 1), 'observeEvent($event)');
+  }
+
+  /// Unobserves event for the internal libmpv instance of this [Player].
+  /// Please use this method only if you know what you are doing, existing methods in [Player] implementation are suited for the most use cases.
+  ///
+  /// See:
+  /// * https://mpv.io/manual/master/#list-of-events
+  ///
+  Future<void> unobserveEvent(
+    int event, {
+    bool waitForInitialization = true,
+  }) async {
+    if (disposed) {
+      throw AssertionError('[Player] has been disposed');
+    }
+
+    if (waitForInitialization) {
+      await waitForPlayerInitialization;
+      await waitForVideoControllerInitializationIfAttached;
+    }
+
+    if (!observedEvents.containsKey(event)) {
+      throw ArgumentError.value(
+        event,
+        'event',
+        'Not observed',
+      );
+    }
+    observedEvents.remove(event);
+    _logError(mpv.mpv_request_event(ctx, event, 0), 'unobserveEvent($event)');
   }
 
   /// Invokes command for the internal libmpv instance of this [Player].
@@ -1449,6 +1523,16 @@ class NativePlayer extends PlatformPlayer {
             'Warning: Received MPV_EVENT_COMMAND_REPLY with unregistered ID ${event.ref.reply_userdata}');
       } else {
         completer.complete(event.ref.error);
+      }
+    }
+
+    final fn = observedEvents[event.ref.event_id];
+    if (fn != null) {
+      try {
+        await fn.call(event);
+      } catch (exception, stacktrace) {
+        print(exception);
+        print(stacktrace);
       }
     }
 
@@ -1723,6 +1807,7 @@ class NativePlayer extends PlatformPlayer {
               String? language;
               bool? image;
               bool? albumart;
+              bool? isDefault;
               String? codec;
               String? decoder;
               int? w;
@@ -1774,6 +1859,9 @@ class NativePlayer extends PlatformPlayer {
                       break;
                     case 'albumart':
                       albumart = map.values[j].u.flag > 0;
+                      break;
+                    case 'default':
+                      isDefault = map.values[j].u.flag > 0;
                       break;
                   }
                 }
@@ -1835,6 +1923,7 @@ class NativePlayer extends PlatformPlayer {
                       rotate: rotate,
                       par: par,
                       audiochannels: audiochannels,
+                      isDefault: isDefault,
                     ),
                   );
                   break;
@@ -1858,6 +1947,7 @@ class NativePlayer extends PlatformPlayer {
                       rotate: rotate,
                       par: par,
                       audiochannels: audiochannels,
+                      isDefault: isDefault,
                     ),
                   );
                   break;
@@ -1881,6 +1971,7 @@ class NativePlayer extends PlatformPlayer {
                       rotate: rotate,
                       par: par,
                       audiochannels: audiochannels,
+                      isDefault: isDefault,
                     ),
                   );
                   break;
@@ -2323,6 +2414,9 @@ class NativePlayer extends PlatformPlayer {
         if (configuration.configDir.isNotEmpty)
           'config-dir': configuration.configDir,
         'load-scripts': configuration.autoLoadScripts ? "yes" : "no",
+        // Skip mpv's AVAudioSession management when the embedder owns the session. iOS-specific.
+        if (Platform.isIOS && !configuration.iosManageAudioSession)
+          'audiounit-skip-session-management': 'yes',
       };
       if (configuration.options != null) {
         options.addAll(configuration.options!);
@@ -2547,33 +2641,38 @@ class NativePlayer extends PlatformPlayer {
   final Map<int, Completer<int>> _commandRequests = {};
 
   Future<void> _setProperty(String name, int format, Pointer<Void> data) async {
-    final requestNumber = _asyncRequestNumber++;
-    final completer = _setPropertyRequests[requestNumber] = Completer<int>();
     final namePtr = name.toNativeUtf8();
-    if (configuration.async) {
-      final immediate = mpv.mpv_set_property_async(
-        ctx,
-        requestNumber,
-        namePtr.cast(),
-        format,
-        data,
-      );
-      final text = '_setProperty($name, $format)';
-      if (immediate < 0) {
-        // Sending failed.
-        _logError(immediate, text);
-        return;
+    try {
+      if (configuration.async) {
+        final requestNumber = _asyncRequestNumber++;
+        final completer =
+            _setPropertyRequests[requestNumber] = Completer<int>();
+        final immediate = mpv.mpv_set_property_async(
+          ctx,
+          requestNumber,
+          namePtr.cast(),
+          format,
+          data,
+        );
+        final text = '_setProperty($name, $format)';
+        if (immediate < 0) {
+          // Sending failed, so no reply event will remove this request.
+          _setPropertyRequests.remove(requestNumber);
+          _logError(immediate, text);
+          return;
+        }
+        _logError(await completer.future, text);
+      } else {
+        mpv.mpv_set_property(
+          ctx,
+          namePtr.cast(),
+          format,
+          data,
+        );
       }
-      _logError(await completer.future, text);
-    } else {
-      mpv.mpv_set_property(
-        ctx,
-        namePtr.cast(),
-        format,
-        data,
-      );
+    } finally {
+      calloc.free(namePtr);
     }
-    calloc.free(namePtr);
   }
 
   Future<void> _setPropertyFlag(String name, bool value) async {
@@ -2623,27 +2722,45 @@ class NativePlayer extends PlatformPlayer {
   Future<void> _command(List<String> args) async {
     final pointers = args.map<Pointer<Utf8>>((e) => e.toNativeUtf8()).toList();
     final arr = calloc<Pointer<Utf8>>(128);
-    for (int i = 0; i < args.length; i++) {
-      (arr + i).value = pointers[i];
-    }
-
-    if (configuration.async) {
-      final requestNumber = _asyncRequestNumber++;
-      final completer = _commandRequests[requestNumber] = Completer<int>();
-      final immediate = mpv.mpv_command_async(ctx, requestNumber, arr.cast());
-      final text = '_command(${args.join(', ')})';
-      if (immediate < 0) {
-        // Sending failed.
-        _logError(immediate, text);
-        return;
+    try {
+      for (int i = 0; i < args.length; i++) {
+        (arr + i).value = pointers[i];
       }
-      _logError(await completer.future, text);
-    } else {
-      mpv.mpv_command(ctx, arr.cast());
-    }
 
-    calloc.free(arr);
-    pointers.forEach(calloc.free);
+      if (configuration.async) {
+        final requestNumber = _asyncRequestNumber++;
+        final completer = _commandRequests[requestNumber] = Completer<int>();
+        final immediate = mpv.mpv_command_async(ctx, requestNumber, arr.cast());
+        final text = '_command(${args.join(', ')})';
+        if (immediate < 0) {
+          // Sending failed, so no reply event will remove this request.
+          _commandRequests.remove(requestNumber);
+          _logError(immediate, text);
+          return;
+        }
+        _logError(await completer.future, text);
+      } else {
+        mpv.mpv_command(ctx, arr.cast());
+      }
+    } finally {
+      calloc.free(arr);
+      pointers.forEach(calloc.free);
+    }
+  }
+
+  String _sanitizeUri(String uri) {
+    // Append \\?\ prefix on Windows to support long file paths.
+    final parser = URIParser(uri);
+    switch (parser.type) {
+      case URIType.file:
+        return addPrefix(parser.file!.path);
+      case URIType.directory:
+        return addPrefix(parser.directory!.path);
+      case URIType.network:
+        return parser.uri!.toString();
+      default:
+        return uri;
+    }
   }
 
   /// Generated libmpv C API bindings.
@@ -2690,6 +2807,11 @@ class NativePlayer extends PlatformPlayer {
   /// Currently observed properties through [observeProperty].
   final HashMap<String, Future<void> Function(String)> observed =
       HashMap<String, Future<void> Function(String)>();
+
+  /// Currently observed events through [observeEvent].
+  final HashMap<int, Future<void> Function(Pointer<generated.mpv_event>)>
+      observedEvents =
+      HashMap<int, Future<void> Function(Pointer<generated.mpv_event>)>();
 
   /// The methods which must execute synchronously before playback of a source can begin.
   final List<Future<void> Function()> onLoadHooks = [];
